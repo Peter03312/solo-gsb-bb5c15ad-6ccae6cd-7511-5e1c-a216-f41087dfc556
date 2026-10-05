@@ -280,12 +280,25 @@ class ReservationOut(BaseModel):
 
 # ----------------------------------------------------------------- 候补
 class WaitlistCreate(DistributionCreate):
-    """候补申请：字段与直接发行申请一致（素材清单/地区/渠道/带时区发行时刻）。
+    """候补申请：沿用直接发行申请字段（素材清单/地区/渠道/带时区发行时刻），
+    另加申请有效期 ``ttl_minutes``（1～1440 分钟，到期时刻 = 受理时刻 +
+    ttl_minutes）。
 
     - 全部可承接：直接生成已通过申请（status=fulfilled，随附申请编号）；
-    - 每项均有匹配授权但额度不足：进入本通道候补队列（status=pending）；
-    - 任一项缺少匹配授权：422 逐项拒绝，不入队。
+    - 每项均有匹配授权但额度不足：进入本通道候补队列（status=pending），
+      仅在有效期内等待成交，处理队首时已过期则标记 expired 并让出位置；
+    - 任一项缺少匹配授权或 ``ttl_minutes`` 缺失/超范围：422 拒绝，不入队。
     """
+
+    ttl_minutes: int = Field(
+        ge=1,
+        le=1440,
+        description=(
+            "候补申请有效期（分钟），范围 1～1440；"
+            "到期时刻 = 受理时刻 + ttl_minutes，"
+            "候补仅在有效期内等待成交（左闭右开，到期时刻即失效）"
+        ),
+    )
 
 
 class WaitlistItemOut(BaseModel):
@@ -302,12 +315,26 @@ class WaitlistOut(BaseModel):
     region: str
     channel: str
     occur_at: datetime
+    # 申请有效期（分钟，1～1440）与到期时刻；pending 仅在到期时刻前可成交。
+    ttl_minutes: int | None = Field(
+        default=None, description="候补申请有效期（分钟），范围 1～1440"
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description="申请失效时刻（受理时刻 + ttl_minutes，带时区）；左闭右开，到达该时刻即失效",
+    )
     # pending=待成交 fulfilled=已成交 failed=已失败（授权不再匹配）
-    # cancelled=已取消。
-    status: Literal["pending", "fulfilled", "failed", "cancelled"]
+    # cancelled=已取消 expired=已失效（超过申请有效期）。
+    status: Literal[
+        "pending", "fulfilled", "failed", "cancelled", "expired"
+    ]
     failure_reason: str | None = Field(
         default=None,
         description="终态失败原因：no_matching_authorization / authorization_inactive",
+    )
+    expiry_reason: str | None = Field(
+        default=None,
+        description="失效原因（status=expired）：当前固定为 ttl_expired",
     )
     distribution_id: int | None = Field(
         default=None, description="成交后生成的发行申请编号"
@@ -316,6 +343,9 @@ class WaitlistOut(BaseModel):
     fulfilled_at: datetime | None = None
     failed_at: datetime | None = None
     cancelled_at: datetime | None = None
+    expired_at: datetime | None = Field(
+        default=None, description="失效时刻（处理队首时被标记为 expired 的时刻）"
+    )
     items: list[WaitlistItemOut] = Field(description="候补素材清单")
     # 仅在已成交（status=fulfilled）时随附完整申请。
     distribution: DistributionOut | None = None

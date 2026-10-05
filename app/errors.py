@@ -238,6 +238,16 @@ class WaitlistAlreadyFailed(WaitlistNotPending):
         )
 
 
+class WaitlistAlreadyExpired(WaitlistNotPending):
+    """候补已过申请有效期（终态）：不可取消。"""
+
+    def __init__(self, waitlist_id: int):
+        super().__init__(
+            code="waitlist_already_expired",
+            message=f"候补已超过申请有效期失效，不可取消：{waitlist_id}",
+        )
+
+
 class InvalidWaitlistStatus(APIError):
     """候补列表查询使用了不支持的状态过滤值。"""
 
@@ -247,6 +257,6 @@ class InvalidWaitlistStatus(APIError):
             code="invalid_waitlist_status",
             message=(
                 f"不支持的候补状态：{value}；"
-                "可选 pending/fulfilled/failed/cancelled"
+                "可选 pending/fulfilled/failed/cancelled/expired"
             ),
         )

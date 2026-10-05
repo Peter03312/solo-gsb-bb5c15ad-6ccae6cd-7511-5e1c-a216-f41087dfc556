@@ -48,8 +48,11 @@ def _upgrade_existing_tables(bind) -> None:
     """对旧版本库做幂等补齐（无需手工迁移）。
 
     预留功能为 ``authorizations`` 增加了 ``reserved_count`` 列与
-    ``ck_auth_reserved_invariant`` 约束；新建库由 ``create_all`` 直接
-    建出，旧库则在此幂等补齐（列存在/约束存在时跳过）。
+    ``ck_auth_reserved_invariant`` 约束；候补有效期功能为 ``waitlists``
+    增加了 ``ttl_minutes`` / ``expires_at`` / ``expiry_reason`` /
+    ``expired_at`` 列，并扩展状态约束以纳入 ``expired`` 终态。
+    新建库由 ``create_all`` 直接建出，旧库则在此幂等补齐
+    （列/约束存在时跳过）。
     """
     from sqlalchemy import text
 
@@ -82,6 +85,74 @@ def _upgrade_existing_tables(bind) -> None:
                     "AND used_count + reserved_count <= max_count)"
                 )
             )
+
+        # 候补申请有效期（1～1440 分钟）相关列：可空以兼容旧记录——
+        # 旧记录 ttl_minutes/expires_at 为空，表示永不按有效期失效，
+        # 其既有状态/成交语义保持不变。
+        for column, ddl in (
+            ("ttl_minutes", "ADD COLUMN ttl_minutes INTEGER"),
+            ("expires_at", "ADD COLUMN expires_at TIMESTAMPTZ"),
+            ("expiry_reason", "ADD COLUMN expiry_reason VARCHAR(64)"),
+            ("expired_at", "ADD COLUMN expired_at TIMESTAMPTZ"),
+        ):
+            exists = conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name='waitlists' AND column_name=:col"
+                ),
+                {"col": column},
+            ).first()
+            if not exists:
+                conn.execute(text(f"ALTER TABLE waitlists {ddl}"))
+
+        # 扩展状态检查约束以纳入 expired：旧约束不含 expired，需替换。
+        status_ck = conn.execute(
+            text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname='ck_wait_status'"
+            )
+        ).scalar()
+        if status_ck is not None and "'expired'" not in status_ck:
+            conn.execute(
+                text("ALTER TABLE waitlists DROP CONSTRAINT ck_wait_status")
+            )
+            status_ck = None
+        if status_ck is None:
+            conn.execute(
+                text(
+                    "ALTER TABLE waitlists ADD CONSTRAINT ck_wait_status "
+                    "CHECK (status IN ('pending', 'fulfilled', 'failed', "
+                    "'cancelled', 'expired'))"
+                )
+            )
+
+        for name, ddl in (
+            (
+                "ck_wait_ttl_range",
+                "CHECK (ttl_minutes IS NULL OR "
+                "(ttl_minutes >= 1 AND ttl_minutes <= 1440))",
+            ),
+            (
+                "ck_wait_ttl_consistency",
+                "CHECK ((ttl_minutes IS NULL) = (expires_at IS NULL))",
+            ),
+            (
+                "ck_wait_expiry_reason",
+                "CHECK (status = 'expired' OR expiry_reason IS NULL)",
+            ),
+        ):
+            exists = conn.execute(
+                text(
+                    "SELECT 1 FROM pg_constraint WHERE conname=:name"
+                ),
+                {"name": name},
+            ).first()
+            if not exists:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE waitlists ADD CONSTRAINT {name} {ddl}"
+                    )
+                )
 
 
 def get_db():

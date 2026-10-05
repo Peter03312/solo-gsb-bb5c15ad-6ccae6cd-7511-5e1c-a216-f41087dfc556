@@ -1,6 +1,6 @@
 # 素材发行授权核验 HTTP API
 
-为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），以及额度不足时的**通道候补队列**（按受理顺序成交/失败/取消，新直接申请不抢候补额度）。
+为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），以及额度不足时的**通道候补队列**（候补可设 **1～1440 分钟申请有效期**，按受理顺序成交/失败/取消/**到期失效**，新直接申请不抢候补额度）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Pydantic v2
 - 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额、不重复释放、候补不重复成交**
@@ -89,10 +89,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/reservations/{id}` | 查询单个预留（读取时惰性结算到期状态） |
 | `POST` | `/reservations/{id}/confirm` | **到期前确认：原子转为一笔已通过申请**（重复确认返回同一笔） |
 | `POST` | `/reservations/{id}/cancel` | **取消预留**（与确认互斥，仅生效一次，释放预留额度） |
-| `POST` | `/waitlists` | **提交候补申请：可承接则直接成交；每项均有匹配授权但额度不足则入队** |
-| `GET` | `/waitlists` | 查询候补列表（`?status=pending/fulfilled/failed/cancelled` 过滤） |
-| `GET` | `/waitlists/{id}` | 查询候补（状态、失败原因及生成的申请编号） |
-| `POST` | `/waitlists/{id}/cancel` | **取消待成交候补**（仅 `pending` 可取消；已成交的请撤销其申请） |
+| `POST` | `/waitlists` | **提交候补申请（含 1～1440 分钟申请有效期）：可承接则直接成交；每项均有匹配授权但额度不足则入队** |
+| `GET` | `/waitlists` | 查询候补列表（`?status=pending/fulfilled/failed/cancelled/expired` 过滤） |
+| `GET` | `/waitlists/{id}` | 查询候补（状态、有效期/失效信息、失败原因及生成的申请编号） |
+| `POST` | `/waitlists/{id}/cancel` | **取消待成交候补**（仅 `pending` 可取消；已成交的请撤销其申请；已失效返回 409） |
 
 ### 核验与占用规则
 
@@ -208,24 +208,48 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 候补规则
 
 发行团队可用与直接申请相同的字段（**素材编号列表、地区、渠道、带时区
-发行时刻**）提交候补申请 `POST /waitlists`；系统先沿用现有匹配及
-重叠授权选择规则逐项判定：
+发行时刻**）**外加申请有效期 `ttl_minutes`（1～1440 分钟，到期时刻
+= 受理时刻 + `ttl_minutes`）**提交候补申请 `POST /waitlists`；系统先
+沿用现有匹配及重叠授权选择规则逐项判定：
 
 1. **全部可承接 → 直接成交**：与直接申请一致地原子占额并生成一笔
    `approved` 申请，候补记录为 `fulfilled` 并关联 `distribution_id`
-   （响应内嵌该申请）。
+   （响应内嵌该申请，同时回显 `ttl_minutes` 与 `expires_at`）。
 2. **每项均有匹配授权但额度不足 → 入队**：仅当每个素材都命中「匹配、
    启用」的授权、纯粹因 `used + reserved = max` 无法承接时，才进入
-   **本通道（region+channel）候补队列**，记录为 `pending`。
-   **候补在队列中不占任何额度**。
+   **本通道（region+channel）候补队列**，记录为 `pending` 并保存
+   `ttl_minutes` / `expires_at`。**候补在队列中不占任何额度**，且
+   **仅在申请有效期内等待成交**。
 3. **缺少匹配授权 → 逐项拒绝**：任一项无匹配授权
    （`no_matching_authorization`）或匹配授权均已停用
    （`authorization_inactive`）时，整体拒绝（422 `waitlist_rejected`，
    `details` 逐项列明原因），**不入队、不占额**。
+4. **字段校验先于业务核验**：`ttl_minutes` 缺失、非整数或不在
+   **1～1440** 区间（以及无时区、重复/未知素材等既有非法字段）一律
+   422 请求体校验拒绝，**不进入核验、不入队**。
+
+**申请有效期与到期失效（左闭右开）**：到期判定为
+`now < expires_at` 才可成交——**恰在到期时刻处理即视为已失效**。
+过期状态采用**惰性结算**，不依赖后台定时任务：
+
+- 任一通道写事务（提交/预留/确认/取消/撤销/改期/改挂/候补受理）在
+  通道咨询锁内、处理队首之前，先把本通道 `expires_at <= now` 的
+  待成交候补统一标记为 **`expired`**，记录**失效时刻** `expired_at`
+  与**失效原因** `expiry_reason`（当前固定为 `ttl_expired`）；
+- **处理队首时，已过期候补被标记 `expired`、释放其队列位置，再按
+  原受理顺序尝试后续候补**；过期候补**不占任何额度**，其让开的额度
+  可被后续有效候补或新直接申请使用；
+- 单条查询 `GET /waitlists/{id}` 也会在通道锁内做一次有效期结算，
+  逾期者立即落库为 `expired`；列表 `GET /waitlists` 为只读视图，
+  对库内仍 `pending` 但已过有效期的候补按 `expired` **派生呈现**
+  （不产生写事务）；
+- 对已失效候补执行取消返回 **409 `waitlist_already_expired`**；
+  有效期功能上线前的历史候补无 `expires_at`，不按有效期失效，
+  其状态/成交语义保持兼容。
 
 **队列处理（按受理顺序，`id` 升序）**：撤销申请、预留取消、预留到期
 （惰性结算）、改期搬移、授权改挂**释放额度后**，以及**新直接申请/
-新候补受理前**，都会在通道咨询锁内重算队首：
+新候补受理前**，都会在通道咨询锁内（先统一失效过期候补，再）重算队首：
 
 - 队首**可整体承接**：原子占额并转为一笔 `approved` 申请
   （`fulfilled`，关联 `distribution_id`），继续处理下一队首；
@@ -243,13 +267,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 **查询与取消**：
 
-- `GET /waitlists/{id}` 返回候补状态、`failure_reason`（失败原因）
-  及 `distribution_id`（成交生成的申请编号）；`GET /waitlists`
-  支持 `?status=pending/fulfilled/failed/cancelled` 过滤。
+- `GET /waitlists/{id}` 返回候补状态、申请有效期（`ttl_minutes` /
+  `expires_at`）、失效信息（`expired` 时的 `expired_at` 与
+  `expiry_reason`）、`failure_reason`（失败原因）、`distribution_id`
+  （成交生成的申请编号，有则**内嵌完整申请**）；`GET /waitlists`
+  支持 `?status=pending/fulfilled/failed/cancelled/expired` 过滤。
 - `POST /waitlists/{id}/cancel`：**仅 `pending` 可取消**（仅生效
   一次，重复取消 409）；已成交（409 `waitlist_already_fulfilled`，
-  如需释放额度请撤销其申请）、已失败（409 `waitlist_already_failed`）
-  为终态不可取消。
+  如需释放额度请撤销其申请）、已失败（409 `waitlist_already_failed`）、
+  **已失效（409 `waitlist_already_expired`）**为终态不可取消。
 - 候补成交生成的申请是普通的 `approved` 申请：**沿用现有撤销规则**
   （`POST /distributions/{id}/revoke`，仅可一次），撤销释放额度后
   同样会触发本通道队首重算；也可查询、改期、参与授权改挂。
@@ -277,7 +303,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 422 | 请求体校验错误（FastAPI 默认格式） | 非法时段（`starts_at >= ends_at`）、时间无时区、次数非正整数、`ttl_minutes` 不在 1～30 等 |
+| 422 | 请求体校验错误（FastAPI 默认格式） | 非法时段（`starts_at >= ends_at`）、时间无时区、次数非正整数、预留 `ttl_minutes` 不在 1～30、候补 `ttl_minutes` 缺失或不在 1～1440 等 |
 | 409 | `duplicate_material` | 素材业务编号已存在 |
 | 422 | `unknown_material` | 登记授权/发行申请/预留引用了未知素材编号 |
 | 422 | `duplicate_material_items` | 同一发行申请/预留中携带重复素材 |
@@ -296,6 +322,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 409 | `waitlist_already_fulfilled` | 对已成交候补执行取消（如需释放额度请撤销其申请） |
 | 409 | `waitlist_already_cancelled` | 重复取消已取消候补 |
 | 409 | `waitlist_already_failed` | 对已失败（授权不再匹配）候补执行取消 |
+| 409 | `waitlist_already_expired` | 对已超过申请有效期失效（`expired`）的候补执行取消 |
 | 422 | `invalid_waitlist_status` | 候补列表使用了不支持的状态过滤值 |
 | 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在） |
 
@@ -308,6 +335,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 候补的终态失败原因 `failure_reason`（重算队首时授权已不再匹配）：
 `no_matching_authorization` 或 `authorization_inactive`。
+
+候补的终态失效原因 `expiry_reason`（处理队首时已过申请有效期）：
+当前固定为 `ttl_expired`，同时记录失效时刻 `expired_at`。
 
 `migration_rejected` 的原因 `reason`（`details` 中附带两端授权编号）：
 
@@ -474,21 +504,29 @@ curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
 ```bash
 # 前提：授权 1（素材 1 / CN / web / max_count=1）的唯一额度已被申请 1 占用
 
-# 17) 提交候补：额度不足但每项均有匹配授权 -> 入队（201，status=pending）
+# 17) 提交候补：沿用素材/地区/渠道/带时区发行时刻，并带申请有效期
+#     ttl_minutes（1～1440 分钟）。额度不足但每项均有匹配授权
+#     -> 入队（201，status=pending）
 curl -s -X POST http://localhost:8000/api/v1/waitlists \
   -H 'Content-Type: application/json' \
   -d '{
     "material_ids": [1],
     "region": "CN",
     "channel": "web",
-    "occur_at": "2026-10-04T15:30:00+08:00"
+    "occur_at": "2026-10-04T15:30:00+08:00",
+    "ttl_minutes": 30
   }'
-# 201：{"id": 1, "status": "pending", "distribution_id": null,
-#       "failure_reason": null, "items": [{"item_index": 0, "material_id": 1}], ...}
-# 若全部可承接则直接成交：status=fulfilled 且随附 distribution_id 与内嵌申请；
-# 若任一项缺少匹配授权 -> 422 waitlist_rejected（details 逐项列明原因，不入队）
+# 201：{"id": 1, "status": "pending", "ttl_minutes": 30,
+#       "expires_at": "2026-10-04T07:55:00Z", "distribution_id": null,
+#       "failure_reason": null, "expiry_reason": null, "expired_at": null,
+#       "items": [{"item_index": 0, "material_id": 1}], ...}
+# 若全部可承接则直接成交：status=fulfilled 且随附 distribution_id 与内嵌申请
+#     （仍回显 ttl_minutes/expires_at）；
+# 若任一项缺少匹配授权 -> 422 waitlist_rejected（details 逐项列明原因，不入队）；
+# ttl_minutes 缺失或不在 1～1440 -> 422 请求体校验错误（同样不入队）。
 
 # 18) 撤销占用额度的申请 -> 释放额度，队首候补原子占额自动成交
+#     （须在候补有效期内；已过期的队首会先标记 expired 并释放位置）
 curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
 curl -s http://localhost:8000/api/v1/waitlists/1
 # {"id": 1, "status": "fulfilled", "distribution_id": 2, "failure_reason": null,
@@ -498,24 +536,37 @@ curl -s http://localhost:8000/api/v1/waitlists/1
 curl -s http://localhost:8000/api/v1/distributions/2
 curl -s -X POST http://localhost:8000/api/v1/distributions/2/revoke
 
+# 19b) 到期失效：处理队首时已过有效期（expires_at <= now，左闭右开）
+#      的候补标记 expired、记录失效时刻与原因并释放队列位置；
+#      单条查询也会惰性结算（无需等待额度释放事件）。
+curl -s http://localhost:8000/api/v1/waitlists/3
+# {"id": 3, "status": "expired", "ttl_minutes": 5,
+#  "expires_at": "2026-10-04T07:35:00Z", "expired_at": "2026-10-04T07:40:02Z",
+#  "expiry_reason": "ttl_expired", "distribution_id": null, ...}
+# 对已失效候补取消 -> 409 waitlist_already_expired
+curl -s -X POST http://localhost:8000/api/v1/waitlists/3/cancel
+
 # 20) 待成交候补可取消（仅 pending 可取消，仅生效一次）
 curl -s -X POST http://localhost:8000/api/v1/waitlists \
   -H 'Content-Type: application/json' \
   -d '{"material_ids": [1], "region": "CN", "channel": "web",
-       "occur_at": "2026-10-04T15:30:00+08:00"}'      # 假设额度又已满 -> pending
-curl -s -X POST http://localhost:8000/api/v1/waitlists/2/cancel
+       "occur_at": "2026-10-04T15:30:00+08:00", "ttl_minutes": 60}'  # 额度又已满 -> pending
+curl -s -X POST http://localhost:8000/api/v1/waitlists/4/cancel
 # 200：status=cancelled；重复取消 -> 409 waitlist_already_cancelled
 # 已成交后取消 -> 409 waitlist_already_fulfilled（请改用撤销申请）
 # 授权改挂停用导致不再匹配 -> 重算时 status=failed、failure_reason 记录原因，
 # 对 failed 取消 -> 409 waitlist_already_failed
+# 超过申请有效期 -> status=expired，对其取消 -> 409 waitlist_already_expired
 
-# 21) 列表与状态过滤
+# 21) 列表与状态过滤（含 expired）
 curl -s "http://localhost:8000/api/v1/waitlists?status=pending"
 curl -s "http://localhost:8000/api/v1/waitlists?status=fulfilled"
+curl -s "http://localhost:8000/api/v1/waitlists?status=expired"
 # 非法过滤值 -> 422 invalid_waitlist_status
 ```
 
-候补成交响应示例（注意 `distribution_id` 与内嵌的完整申请）：
+候补成交响应示例（注意 `distribution_id`、内嵌的完整申请，
+以及申请有效期 `ttl_minutes` / `expires_at`）：
 
 ```json
 {
@@ -523,13 +574,17 @@ curl -s "http://localhost:8000/api/v1/waitlists?status=fulfilled"
   "region": "CN",
   "channel": "web",
   "occur_at": "2026-10-04T15:30:00+08:00",
+  "ttl_minutes": 30,
+  "expires_at": "2026-10-04T08:01:00Z",
   "status": "fulfilled",
   "failure_reason": null,
+  "expiry_reason": null,
   "distribution_id": 2,
   "created_at": "2026-10-04T07:31:00Z",
   "fulfilled_at": "2026-10-04T07:40:00Z",
   "failed_at": null,
   "cancelled_at": null,
+  "expired_at": null,
   "items": [{"item_index": 0, "material_id": 1}],
   "distribution": {
     "id": 2,
@@ -547,6 +602,31 @@ curl -s "http://localhost:8000/api/v1/waitlists?status=fulfilled"
       }
     ]
   }
+}
+```
+
+候补到期失效响应示例（`status=expired`，返回有效期、失效时刻与原因；
+无成交申请）：
+
+```json
+{
+  "id": 3,
+  "region": "CN",
+  "channel": "web",
+  "occur_at": "2026-10-04T15:30:00+08:00",
+  "ttl_minutes": 5,
+  "expires_at": "2026-10-04T07:35:00Z",
+  "status": "expired",
+  "failure_reason": null,
+  "expiry_reason": "ttl_expired",
+  "distribution_id": null,
+  "created_at": "2026-10-04T07:30:00Z",
+  "fulfilled_at": null,
+  "failed_at": null,
+  "cancelled_at": null,
+  "expired_at": "2026-10-04T07:40:02Z",
+  "items": [{"item_index": 0, "material_id": 1}],
+  "distribution": null
 }
 ```
 
@@ -627,6 +707,7 @@ curl -s "http://localhost:8000/api/v1/waitlists?status=fulfilled"
 ```
 通道咨询锁 pg_advisory_xact_lock(region+channel)
         → 到期预留惰性结算（reservations / authorizations）
+        → 候补有效期失效结算（expires_at <= now 的 pending → expired）
         → 候补队列处理（waitlists，受理顺序逐队首）
         → 预留/申请/候补行锁（id 升序）
         → 授权行锁（authorizations，id 升序）
@@ -646,13 +727,18 @@ curl -s "http://localhost:8000/api/v1/waitlists?status=fulfilled"
    `reserved_count` 并把预留置为 `expired`。因此到期预留对随后的提交/
    预留余量判定立即可见（**到期即释放**），且到期释放与确认/取消在同
    通道内天然互斥，不会重复释放。无需后台定时任务。
-3. **候补队列处理**：到期结算、撤销、预留取消、改期搬移、改挂释放
-   额度后，以及新直接申请/新候补受理前，在通道锁内按受理顺序
-   （`id` 升序）`FOR UPDATE` 逐队首重算：可整体承接则条件占额并
-   原子生成一笔 `approved` 申请（同一事务内状态翻转
+3. **候补有效期失效与队列处理**：到期结算之后、重算队首之前，先把
+   本通道 `expires_at <= now`（左闭右开）的待成交候补 `FOR UPDATE`
+   锁定并统一标记为 `expired`（记录 `expired_at` 与 `ttl_expired`
+   原因），它们不占额度、立即释放队列位置。随后在撤销、预留取消、
+   改期搬移、改挂释放额度后，以及新直接申请/新候补受理前，在通道锁内
+   按受理顺序（`id` 升序）`FOR UPDATE` 逐队首重算：可整体承接则条件
+   占额并原子生成一笔 `approved` 申请（同一事务内状态翻转
    `pending → fulfilled`，**不会重复生成申请**）；额度仍不足则停止
    本轮；授权已不再匹配则标记 `failed` 并继续后项。新直接申请因此
-   永远不会抢走可成交候补的额度。
+   永远不会抢走可成交候补的额度，过期候补也不会阻塞后续候补/新申请。
+   单条候补查询在通道锁内只做「有效期失效结算」（不重算成交/失败），
+   使逾期者立即呈现；列表查询则只读派生 `expired` 状态。
 4. **行锁 `SELECT ... FOR UPDATE`**：预留/申请/候补行锁串行化对同一
    对象的并发操作（确认与取消恰为一方 200、一方 409；并发双重确认
    均 200 但只生成一笔申请；并发双重取消恰为一次 200、一次 409；
@@ -708,12 +794,17 @@ curl -s "http://localhost:8000/api/v1/waitlists?status=fulfilled"
   **改挂与新预留并发**、到期释放与逾期确认/新申请竞争、多素材并发预留），
   断言绝不超额、不重复释放且
   `used_count`/`reserved_count` 与有效明细账实相符。
-- `tests/test_waitlist.py`：110 项候补端到端与并发用例，覆盖直接成交/
+- `tests/test_waitlist.py`：候补端到端与并发用例，覆盖直接成交/
   入队不占额/缺匹配逐项拒绝、撤销/预留取消/预留到期/改期/改挂触发的
   队首成交、FIFO 与队首阻塞（停止本轮）、授权不再匹配标记失败并继续
-  后项、新直接申请不抢可成交候补额度、取消与四态查询过滤、成交申请
+  后项、新直接申请不抢可成交候补额度、取消与状态查询过滤、成交申请
   沿用撤销规则、重叠授权选择顺序，以及并发受理+并发释放不重复成交、
-  直接申请与候补混合并发不超额、并发重复取消恰一次生效、账实相符。
+  直接申请与候补混合并发不超额、并发重复取消恰一次生效；**另覆盖
+  申请有效期 `ttl_minutes`（1～1440）字段回显与缺失/超范围 422、
+  到期左闭右开边界、队首过期标记 `expired`（失效时刻/`ttl_expired`
+  原因）并释放位置、其后有效候补按序成交、有效期内正常成交、查询惰性
+  失效与列表派生 expired、取消过期 409、过期不占额不阻塞新申请、
+  多笔过期一次性清理**，以及账实相符。
 
 ```bash
 pip install -r requirements.txt httpx

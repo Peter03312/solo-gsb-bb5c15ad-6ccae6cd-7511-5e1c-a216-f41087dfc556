@@ -20,7 +20,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
 
 os.environ.setdefault(
@@ -91,7 +91,8 @@ def apply(client, mids, region="CN", channel="web", occur=OCCUR):
     )
 
 
-def waitlist(client, mids, region="CN", channel="web", occur=OCCUR):
+def waitlist(client, mids, region="CN", channel="web", occur=OCCUR,
+             ttl=60):
     return client.post(
         "/api/v1/waitlists",
         json={
@@ -99,6 +100,7 @@ def waitlist(client, mids, region="CN", channel="web", occur=OCCUR):
             "region": region,
             "channel": channel,
             "occur_at": occur,
+            "ttl_minutes": ttl,
         },
     )
 
@@ -119,6 +121,21 @@ def force_expire(reservation_id):
             sa_update(models.Reservation)
             .where(models.Reservation.id == reservation_id)
             .values(expires_at=func.now())
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def set_waitlist_expiry(waitlist_id, at_sql):
+    """直接改写库内候补到期时刻（at_sql 为相对 now 的 SQL，如 now()、
+    now() + interval '1 minute'），用于确定性验证有效期边界。"""
+    db = SessionLocal()
+    try:
+        db.execute(
+            sa_update(models.Waitlist)
+            .where(models.Waitlist.id == waitlist_id)
+            .values(expires_at=text(at_sql))
         )
         db.commit()
     finally:
@@ -258,8 +275,23 @@ def main() -> int:
           and r.json()["error"]["code"] == "unknown_material", r.text)
     r = c.post("/api/v1/waitlists", json={
         "material_ids": [m1], "region": "CN", "channel": "web",
-        "occur_at": "2026-10-15T12:00:00"})
+        "occur_at": "2026-10-15T12:00:00", "ttl_minutes": 30})
     check("无时区 422", r.status_code == 422, r.text)
+    r = c.post("/api/v1/waitlists", json={
+        "material_ids": [m1], "region": "CN", "channel": "web",
+        "occur_at": "2026-10-15T12:00:00+08:00"})
+    check("缺少 ttl_minutes 422", r.status_code == 422, r.text)
+    for bad_ttl in (0, -5, 1441, 9999):
+        r = c.post("/api/v1/waitlists", json={
+            "material_ids": [m1], "region": "CN", "channel": "web",
+            "occur_at": "2026-10-15T12:00:00+08:00",
+            "ttl_minutes": bad_ttl})
+        check(f"ttl 超范围 {bad_ttl} 422", r.status_code == 422, r.text)
+    # ttl 超范围 / 缺字段即使缺匹配授权，也因请求体校验先被拒（不入队）
+    r = c.post("/api/v1/waitlists", json={
+        "material_ids": [m1], "region": "ZZ", "channel": "nope",
+        "occur_at": "2026-10-15T12:00:00+08:00", "ttl_minutes": 0})
+    check("字段非法先 422（不进入核验）", r.status_code == 422, r.text)
     r = get_wait(c, 99999)
     check("未知候补 404",
           r.status_code == 404 and r.json()["error"]["code"] == "not_found",
@@ -497,10 +529,15 @@ def main() -> int:
     r = c.get("/api/v1/waitlists", params={"status": "cancelled"})
     check("过滤 cancelled",
           any(w["id"] == w_c1 for w in r.json()), r.text)
+    r = c.get("/api/v1/waitlists", params={"status": "expired"})
+    check("过滤 expired 200", r.status_code == 200, r.text)
+    check("过滤 expired 只含失效项",
+          all(w["status"] == "expired" for w in r.json()), r.text)
     n = sum(len(c.get("/api/v1/waitlists",
                       params={"status": s}).json())
-            for s in ("pending", "fulfilled", "failed", "cancelled"))
-    check("四态合计等于总数", n == total, f"{n} != {total}")
+            for s in ("pending", "fulfilled", "failed", "cancelled",
+                      "expired"))
+    check("五态合计等于总数", n == total, f"{n} != {total}")
     r = c.get("/api/v1/waitlists", params={"status": "bogus"})
     check("非法过滤值 422",
           r.status_code == 422
@@ -552,7 +589,7 @@ def main() -> int:
         cc = new_client()
         return cc.post("/api/v1/waitlists", json={
             "material_ids": [m13], "region": "CN", "channel": "web",
-            "occur_at": OCCUR}).json()["id"]
+            "occur_at": OCCUR, "ttl_minutes": 60}).json()["id"]
 
     with ThreadPoolExecutor(max_workers=10) as ex:
         wids = list(ex.map(submit_wait, range(10)))
@@ -599,7 +636,7 @@ def main() -> int:
     def wait(i):
         return new_client().post("/api/v1/waitlists", json={
             "material_ids": [m14], "region": "CN", "channel": "web",
-            "occur_at": OCCUR}).json()["status"]
+            "occur_at": OCCUR, "ttl_minutes": 60}).json()["status"]
 
     with ThreadPoolExecutor(max_workers=16) as ex:
         futs = [ex.submit(direct, i) for i in range(10)]
@@ -655,7 +692,8 @@ def main() -> int:
     m17 = make_material(c, "wl-m17")
     a17 = make_auth(c, m17, 1, region="ISO3")
     d17 = apply(c, [m17], region="ISO3").json()["id"]
-    w17 = waitlist(c, [m17], region="ISO3").json()["id"]
+    # 长有效期：本用例验证「授权停用」失败路径，排除到期失效干扰。
+    w17 = waitlist(c, [m17], region="ISO3", ttl=1440).json()["id"]
     check("候补入队", get_wait(c, w17).json()["status"] == "pending")
     c.patch(f"/api/v1/authorizations/{a17}", json={"status": "inactive"})
     check("停用后未触发重算仍等待",
@@ -665,6 +703,194 @@ def main() -> int:
     check("重算标记 failed", body["status"] == "failed", body)
     check("失败原因 authorization_inactive",
           body["failure_reason"] == "authorization_inactive", body)
+
+    print("== 23. 有效期字段：受理时记录 ttl/expires_at ==")
+    mt = make_material(c, "wl-ttl")
+    at = make_auth(c, mt, 1, region="ISOT")
+
+    # 入队路径
+    dt = apply(c, [mt], region="ISOT").json()["id"]
+    r = waitlist(c, [mt], region="ISOT", ttl=90)
+    check("入队 201", r.status_code == 201, r.text)
+    body = r.json()
+    check("回显 ttl_minutes=90", body["ttl_minutes"] == 90, body)
+    check("回显 expires_at", body["expires_at"] is not None, body)
+    check("pending 无失效时刻", body["expired_at"] is None, body)
+    check("pending 无失效原因", body["expiry_reason"] is None, body)
+    created = datetime.fromisoformat(body["created_at"])
+    expires = datetime.fromisoformat(body["expires_at"])
+    delta = (expires - created).total_seconds()
+    check("expires_at ≈ created_at + 90min",
+          abs(delta - 90 * 60) <= 5, f"delta={delta}")
+    wt = body["id"]
+
+    # ttl 边界 1 与 1440 可受理（额度满 → 入队）
+    check("ttl=1 可受理",
+          waitlist(c, [mt], region="ISOT", ttl=1).status_code == 201)
+    check("ttl=1440 可受理",
+          waitlist(c, [mt], region="ISOT", ttl=1440).status_code == 201)
+
+    # 直接成交路径同样记录有效期：先撤销 dt，wt（队首）成交，其后两笔
+    # 仍排队（额度仅 1）；再撤销 wt 生成的申请会成交下一笔，故另取一个
+    # 空闲通道验证「直接成交」回显。
+    c.post(f"/api/v1/distributions/{dt}/revoke")  # 触发队列（wt 成交）
+    check("wt 在有效期内成交", get_wait(c, wt).json()["status"] == "fulfilled")
+
+    mt2 = make_material(c, "wl-ttl2")
+    make_auth(c, mt2, 1, region="ISOT2")
+    r = waitlist(c, [mt2], region="ISOT2", ttl=30)
+    body = r.json()
+    check("空闲直接成交 201", r.status_code == 201, r.text)
+    check("直接成交 fulfilled", body["status"] == "fulfilled", body)
+    check("直接成交也回显 ttl", body["ttl_minutes"] == 30, body)
+    check("直接成交也回显 expires_at",
+          body["expires_at"] is not None, body)
+    check("直接成交无失效信息",
+          body["expired_at"] is None and body["expiry_reason"] is None, body)
+
+    print("== 24. 队首过期：标记 expired、释放位置、后续按序成交 ==")
+    me = make_material(c, "wl-exp1")
+    ae = make_auth(c, me, 1, region="ISOE1")
+    de = apply(c, [me], region="ISOE1").json()["id"]
+    we_head = waitlist(c, [me], region="ISOE1", ttl=1).json()["id"]
+    check("队首排队",
+          get_wait(c, we_head).json()["status"] == "pending")
+    # 恰在到期时刻：左闭右开即失效
+    set_waitlist_expiry(we_head, "now()")
+    # 释放唯一额度触发本通道队列：队首已过期 → 标记 expired 并释放位置，
+    # 释放出的额度不会被死候补占用。
+    c.post(f"/api/v1/distributions/{de}/revoke")
+    body = get_wait(c, we_head).json()
+    check("队首标记 expired", body["status"] == "expired", body)
+    check("失效原因 ttl_expired",
+          body["expiry_reason"] == "ttl_expired", body)
+    check("失效时刻已记录", body["expired_at"] is not None, body)
+    check("失效无申请编号", body["distribution_id"] is None, body)
+    check("失效无 failure_reason", body["failure_reason"] is None, body)
+    check("有效期仍可查询",
+          body["ttl_minutes"] == 1 and body["expires_at"] is not None, body)
+    check("过期候补不占额 ae used=0", get_auth(c, ae)["used_count"] == 0)
+    ok_e, used_e, _ = books(ae)
+    check("ae 账实相符", ok_e and used_e == 0, f"used={used_e}")
+
+    # 过期队首释放位置后，其后的有效候补可按序成交
+    me2 = make_material(c, "wl-exp2")
+    ae2 = make_auth(c, me2, 1, region="ISOE2")
+    de2 = apply(c, [me2], region="ISOE2").json()["id"]
+    we_old = waitlist(c, [me2], region="ISOE2", ttl=1).json()["id"]
+    we_next = waitlist(c, [me2], region="ISOE2", ttl=1440).json()["id"]
+    set_waitlist_expiry(we_old, "now() - interval '1 second'")
+    set_waitlist_expiry(we_next, "now() + interval '10 minutes'")
+    c.post(f"/api/v1/distributions/{de2}/revoke")
+    check("过期队首 expired",
+          get_wait(c, we_old).json()["status"] == "expired")
+    body = get_wait(c, we_next).json()
+    check("其后有效候补按序成交", body["status"] == "fulfilled", body)
+    check("成交申请编号", body["distribution_id"] is not None, body)
+    check("ae2 被有效候补占用 used=1",
+          get_auth(c, ae2)["used_count"] == 1)
+
+    print("== 25. 有效期内正常成交（未过期不受影响） ==")
+    mv = make_material(c, "wl-valid")
+    av = make_auth(c, mv, 1, region="ISOV")
+    dv = apply(c, [mv], region="ISOV").json()["id"]
+    wv = waitlist(c, [mv], region="ISOV", ttl=60).json()["id"]
+    # expires_at 设为未来 10 分钟（仍有效），释放额度应正常成交而非失效
+    set_waitlist_expiry(wv, "now() + interval '10 minutes'")
+    c.post(f"/api/v1/distributions/{dv}/revoke")
+    body = get_wait(c, wv).json()
+    check("有效期内释放 → 成交而非过期",
+          body["status"] == "fulfilled", body)
+    check("成交有申请编号", body["distribution_id"] is not None, body)
+    check("成交无失效信息", body["expired_at"] is None, body)
+
+    print("== 26. 过期查询与取消语义 ==")
+    mx = make_material(c, "wl-x")
+    ax = make_auth(c, mx, 1, region="ISOX")
+    dx = apply(c, [mx], region="ISOX").json()["id"]
+    wx = waitlist(c, [mx], region="ISOX", ttl=5).json()["id"]
+    set_waitlist_expiry(wx, "now()")
+    # 单条查询触发通道惰性失效（无需等待额度释放事件）
+    body = get_wait(c, wx).json()
+    check("查询即惰性标记 expired", body["status"] == "expired", body)
+    check("查询返回失效时刻", body["expired_at"] is not None, body)
+    check("查询返回失效原因", body["expiry_reason"] == "ttl_expired", body)
+    # 取消已过期候补 → 409 waitlist_already_expired
+    r = c.post(f"/api/v1/waitlists/{wx}/cancel")
+    check("取消过期候补 409",
+          r.status_code == 409
+          and r.json()["error"]["code"] == "waitlist_already_expired",
+          r.text)
+    # 即便随后释放额度，过期候补也不成交
+    c.post(f"/api/v1/distributions/{dx}/revoke")
+    check("释放后仍 expired",
+          get_wait(c, wx).json()["status"] == "expired")
+    check("过期后额度未被它占用", get_auth(c, ax)["used_count"] == 0)
+
+    # 列表按 expired 过滤可查到（已落库 + 派生两种都覆盖）
+    my = make_material(c, "wl-y")
+    ay = make_auth(c, my, 1, region="ISOY")
+    apply(c, [my], region="ISOY")
+    wy = waitlist(c, [my], region="ISOY", ttl=3).json()["id"]
+    set_waitlist_expiry(wy, "now()")
+    # 不触发任何写事务，直接列表：库内仍 pending，按 expired 派生呈现
+    rows = c.get("/api/v1/waitlists", params={"status": "expired"}).json()
+    check("列表派生 expired 含 wy",
+          any(w["id"] == wy and w["status"] == "expired"
+              and w["expiry_reason"] == "ttl_expired" for w in rows),
+          str([(w["id"], w["status"]) for w in rows]))
+    rows_pending = c.get(
+        "/api/v1/waitlists", params={"status": "pending"}).json()
+    check("派生过期候补不计入 pending",
+          all(w["id"] != wy for w in rows_pending))
+    # 派生过期候补取消时落库为 expired 并返回 409
+    r = c.post(f"/api/v1/waitlists/{wy}/cancel")
+    check("派生过期候补取消亦 409",
+          r.status_code == 409
+          and r.json()["error"]["code"] == "waitlist_already_expired",
+          r.text)
+    check("取消后已落库 expired",
+          get_wait(c, wy).json()["status"] == "expired")
+
+    print("== 27. 队首过期后，新直接申请可用释放出的额度（不被死候补阻塞） ==")
+    mn = make_material(c, "wl-next")
+    an = make_auth(c, mn, 1, region="ISON")
+    dn = apply(c, [mn], region="ISON").json()["id"]
+    wn = waitlist(c, [mn], region="ISON", ttl=1).json()["id"]
+    set_waitlist_expiry(wn, "now()")
+    # 新直接申请：先处理队列（过期候补失效），再判定自身 → 可用额度通过
+    r = c.post(f"/api/v1/distributions/{dn}/revoke")
+    check("撤销成功", r.status_code == 200, r.text)
+    r = apply(c, [mn], region="ISON")
+    check("过期候补不阻塞新直接申请", r.status_code == 201, r.text)
+    check("候补终态 expired",
+          get_wait(c, wn).json()["status"] == "expired")
+    check("授权被新申请占用 used=1", get_auth(c, an)["used_count"] == 1)
+
+    print("== 28. 多笔过期一次性清理，仍按受理顺序成交有效候补 ==")
+    mg = make_material(c, "wl-gap")
+    ag = make_auth(c, mg, 3, region="ISOG")
+    holders_g = [apply(c, [mg], region="ISOG").json()["id"] for _ in range(3)]
+    wg1 = waitlist(c, [mg], region="ISOG", ttl=1).json()["id"]
+    wg2 = waitlist(c, [mg], region="ISOG", ttl=1).json()["id"]
+    wg3 = waitlist(c, [mg], region="ISOG", ttl=1440).json()["id"]
+    wg4 = waitlist(c, [mg], region="ISOG", ttl=1440).json()["id"]
+    # 前两笔过期，后两笔有效；一次撤销释放 1 个额度
+    set_waitlist_expiry(wg1, "now()")
+    set_waitlist_expiry(wg2, "now() - interval '1 minute'")
+    c.post(f"/api/v1/distributions/{holders_g[0]}/revoke")
+    check("wg1 expired", get_wait(c, wg1).json()["status"] == "expired")
+    check("wg2 expired", get_wait(c, wg2).json()["status"] == "expired")
+    check("wg3（第一笔有效）成交",
+          get_wait(c, wg3).json()["status"] == "fulfilled")
+    check("wg4 仍等待（严格 FIFO，额度已尽）",
+          get_wait(c, wg4).json()["status"] == "pending")
+    c.post(f"/api/v1/distributions/{holders_g[1]}/revoke")
+    check("再释放后 wg4 成交",
+          get_wait(c, wg4).json()["status"] == "fulfilled")
+    ok_g, used_g, resv_g = books(ag)
+    check("ag 账实相符：2 笔有效候补成交、1 笔存量占用",
+          ok_g and used_g == 3, f"used={used_g} resv={resv_g}")
 
     print(f"\n结果：{passed} 通过，{failed} 失败")
     return 1 if failed else 0
