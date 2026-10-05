@@ -261,27 +261,41 @@ class Waitlist(Base):
 
     生命周期状态：
 
-    - ``pending``   待成交（队列中按受理顺序等待，**不占任何额度**）
+    - ``pending``   待成交（队列中按受理顺序等待，**不占任何额度**；
+      仅在受理后的 ``ttl_minutes`` 有效期内等待成交）
     - ``fulfilled`` 已成交（额度释放后重算队首时整体可承接，已原子占额
       并转为一笔 approved 发行申请）
     - ``failed``    已失败（重算时授权已不再匹配——无匹配授权或匹配授权
       均已停用，终态，``failure_reason`` 记录原因）
+    - ``expired``   已过期（重算队首或惰性结算时已过有效期，终态，
+      ``expired_at`` 记录失效时刻、``expire_reason`` 记录失效原因）
     - ``cancelled`` 已取消（待成交时被取消，终态，仅生效一次）
 
     候补按受理顺序（``id`` 升序）处理：撤销、预留取消/到期、改期、改挂
-    释放额度后重算队首——可整体承接则原子占额转申请并继续下一队首；
+    释放额度后重算队首——**已过期队首先标记 expired 并释放队列位置**，
+    再按原顺序尝试后续候补；可整体承接则原子占额转申请并继续下一队首；
     额度仍不足则停止本轮；授权已不再匹配则标记失败并继续后项。
     """
 
     __tablename__ = "waitlists"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'fulfilled', 'failed', 'cancelled')",
+            "status IN ('pending', 'fulfilled', 'failed', 'cancelled', "
+            "'expired')",
             name="ck_wait_status",
         ),
         CheckConstraint(
             "(status = 'fulfilled') = (distribution_id IS NOT NULL)",
             name="ck_wait_distribution",
+        ),
+        CheckConstraint(
+            "ttl_minutes >= 1 AND ttl_minutes <= 1440",
+            name="ck_wait_ttl_range",
+        ),
+        # 仅终态过期记录失效时刻；置为 expired 时写一次。
+        CheckConstraint(
+            "(status = 'expired') = (expired_at IS NOT NULL)",
+            name="ck_wait_expired_at",
         ),
         Index("ix_wait_queue", "region", "channel", "status", "id"),
     )
@@ -292,12 +306,21 @@ class Waitlist(Base):
     occur_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    # 候补申请有效期（分钟，1～1440）；到期时刻 = 受理时刻 + ttl_minutes。
+    ttl_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     status: Mapped[str] = mapped_column(
         String(16), default="pending", nullable=False
     )
     # 终态失败原因（重算时授权已不再匹配）：no_matching_authorization /
     # authorization_inactive；仅 failed 状态有值。
     failure_reason: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    # 终态失效原因（有效期内未成交）：固定 ttl_expired；仅 expired 有值。
+    expire_reason: Mapped[str | None] = mapped_column(
         String(64), nullable=True
     )
     # 成交后指向由本候补生成的那笔 approved 申请。
@@ -308,6 +331,9 @@ class Waitlist(Base):
         DateTime(timezone=True), nullable=True
     )
     failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expired_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     cancelled_at: Mapped[datetime | None] = mapped_column(

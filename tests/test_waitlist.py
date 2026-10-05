@@ -7,8 +7,11 @@
   可整体承接则原子占额转一笔申请；额度仍不足停止本轮；
   授权已不再匹配则标记失败并继续后项。
 - 新直接申请须先处理可成交候补，不得抢走其额度。
-- 查询返回候补状态、失败原因及生成的申请编号；待处理候补可取消；
-  已成交申请沿用现有撤销规则。
+- 查询返回候补状态、有效期（ttl_minutes/expires_at）、失效信息
+  （expired/expire_reason/expired_at）、失败原因及生成的申请编号；
+  待处理候补可取消（已过期取消 409）；已成交申请沿用现有撤销规则。
+- 申请有效期 1～1440：提交校验；队首过期标记 expired、记录失效时刻
+  与原因并释放队列位置，再按原顺序尝试后续候补；查询/列表惰性过期。
 - 并发释放与受理不重复生成申请、不超额，账实相符。
 
 运行：
@@ -91,7 +94,7 @@ def apply(client, mids, region="CN", channel="web", occur=OCCUR):
     )
 
 
-def waitlist(client, mids, region="CN", channel="web", occur=OCCUR):
+def waitlist(client, mids, region="CN", channel="web", occur=OCCUR, ttl=60):
     return client.post(
         "/api/v1/waitlists",
         json={
@@ -99,6 +102,7 @@ def waitlist(client, mids, region="CN", channel="web", occur=OCCUR):
             "region": region,
             "channel": channel,
             "occur_at": occur,
+            "ttl_minutes": ttl,
         },
     )
 
@@ -118,6 +122,20 @@ def force_expire(reservation_id):
         db.execute(
             sa_update(models.Reservation)
             .where(models.Reservation.id == reservation_id)
+            .values(expires_at=func.now())
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def force_waitlist_expire(waitlist_id):
+    """直接把候补失效时刻改为当前时刻（左闭右开：now == expires_at 即逾期）。"""
+    db = SessionLocal()
+    try:
+        db.execute(
+            sa_update(models.Waitlist)
+            .where(models.Waitlist.id == waitlist_id)
             .values(expires_at=func.now())
         )
         db.commit()
@@ -190,6 +208,12 @@ def main() -> int:
     check("内嵌申请两项明细", len(body["distribution"]["items"]) == 2, body)
     check("失败原因为空", body["failure_reason"] is None, body)
     check("fulfilled_at 已记录", body["fulfilled_at"] is not None, body)
+    check("回显 ttl_minutes=60", body["ttl_minutes"] == 60, body)
+    check("返回 expires_at", body.get("expires_at") is not None, body)
+    check("成交候补 expire_reason 为空",
+          body.get("expire_reason") is None, body)
+    check("成交候补 expired_at 为空",
+          body.get("expired_at") is None, body)
     d1 = body["distribution_id"]
     check("申请可查询",
           c.get(f"/api/v1/distributions/{d1}").status_code == 200)
@@ -205,6 +229,11 @@ def main() -> int:
     check("状态 pending", body["status"] == "pending", body)
     check("无申请编号", body["distribution_id"] is None, body)
     check("候补素材清单两项", len(body["items"]) == 2, body)
+    check("回显 ttl_minutes=60", body["ttl_minutes"] == 60, body)
+    check("expires_at 晚于 created_at",
+          body["expires_at"] > body["created_at"], body)
+    check("pending 无失效信息",
+          body["expire_reason"] is None and body["expired_at"] is None, body)
     w1 = body["id"]
     check("入队不占额：授权1 used 仍为 1", get_auth(c, a1)["used_count"] == 1)
     check("入队不占额：授权2 used 仍为 1", get_auth(c, a2)["used_count"] == 1)
@@ -258,8 +287,17 @@ def main() -> int:
           and r.json()["error"]["code"] == "unknown_material", r.text)
     r = c.post("/api/v1/waitlists", json={
         "material_ids": [m1], "region": "CN", "channel": "web",
-        "occur_at": "2026-10-15T12:00:00"})
+        "occur_at": "2026-10-15T12:00:00", "ttl_minutes": 60})
     check("无时区 422", r.status_code == 422, r.text)
+    r = c.post("/api/v1/waitlists", json={
+        "material_ids": [m1], "region": "CN", "channel": "web",
+        "occur_at": OCCUR})
+    check("缺少 ttl_minutes 422", r.status_code == 422, r.text)
+    for bad_ttl in (0, -5, 1441, 99999):
+        r = c.post("/api/v1/waitlists", json={
+            "material_ids": [m1], "region": "CN", "channel": "web",
+            "occur_at": OCCUR, "ttl_minutes": bad_ttl})
+        check(f"ttl={bad_ttl} 超范围 422", r.status_code == 422, r.text)
     r = get_wait(c, 99999)
     check("未知候补 404",
           r.status_code == 404 and r.json()["error"]["code"] == "not_found",
@@ -497,10 +535,13 @@ def main() -> int:
     r = c.get("/api/v1/waitlists", params={"status": "cancelled"})
     check("过滤 cancelled",
           any(w["id"] == w_c1 for w in r.json()), r.text)
+    r = c.get("/api/v1/waitlists", params={"status": "expired"})
+    check("过滤 expired 可查询（当前可能为空）", r.status_code == 200, r.text)
     n = sum(len(c.get("/api/v1/waitlists",
                       params={"status": s}).json())
-            for s in ("pending", "fulfilled", "failed", "cancelled"))
-    check("四态合计等于总数", n == total, f"{n} != {total}")
+            for s in ("pending", "fulfilled", "failed", "expired",
+                      "cancelled"))
+    check("五态合计等于总数", n == total, f"{n} != {total}")
     r = c.get("/api/v1/waitlists", params={"status": "bogus"})
     check("非法过滤值 422",
           r.status_code == 422
@@ -552,7 +593,7 @@ def main() -> int:
         cc = new_client()
         return cc.post("/api/v1/waitlists", json={
             "material_ids": [m13], "region": "CN", "channel": "web",
-            "occur_at": OCCUR}).json()["id"]
+            "occur_at": OCCUR, "ttl_minutes": 60}).json()["id"]
 
     with ThreadPoolExecutor(max_workers=10) as ex:
         wids = list(ex.map(submit_wait, range(10)))
@@ -599,7 +640,7 @@ def main() -> int:
     def wait(i):
         return new_client().post("/api/v1/waitlists", json={
             "material_ids": [m14], "region": "CN", "channel": "web",
-            "occur_at": OCCUR}).json()["status"]
+            "occur_at": OCCUR, "ttl_minutes": 60}).json()["status"]
 
     with ThreadPoolExecutor(max_workers=16) as ex:
         futs = [ex.submit(direct, i) for i in range(10)]
@@ -665,6 +706,151 @@ def main() -> int:
     check("重算标记 failed", body["status"] == "failed", body)
     check("失败原因 authorization_inactive",
           body["failure_reason"] == "authorization_inactive", body)
+
+    print("== 23. 有效期：队首过期标记 expired 并继续后续候补 ==")
+    me = make_material(c, "wl-exp")
+    ae = make_auth(c, me, 1, region="TT1")
+    de = apply(c, [me], region="TT1").json()["id"]
+    w_exp1 = waitlist(c, [me], region="TT1", ttl=1).json()["id"]
+    w_exp2 = waitlist(c, [me], region="TT1", ttl=60).json()["id"]
+    check("两笔入队",
+          get_wait(c, w_exp1).json()["status"] == "pending"
+          and get_wait(c, w_exp2).json()["status"] == "pending")
+    # 队首过期、次笔仍有效：释放额度后队首 expired、次笔按原顺序成交
+    force_waitlist_expire(w_exp1)
+    r = c.post(f"/api/v1/distributions/{de}/revoke")
+    check("撤销 200", r.status_code == 200, r.text)
+    body1 = get_wait(c, w_exp1).json()
+    check("队首标记 expired", body1["status"] == "expired", body1)
+    check("失效原因 ttl_expired",
+          body1["expire_reason"] == "ttl_expired", body1)
+    check("记录失效时刻", body1["expired_at"] is not None, body1)
+    check("过期无申请编号", body1["distribution_id"] is None, body1)
+    check("过期回显 ttl/有效期", body1["ttl_minutes"] == 1
+          and body1["expires_at"] is not None, body1)
+    body2 = get_wait(c, w_exp2).json()
+    check("后续有效候补成交", body2["status"] == "fulfilled", body2)
+    check("成交有申请编号", body2["distribution_id"] is not None, body2)
+    check("成交申请 approved",
+          body2["distribution"]["status"] == "approved", body2)
+    ok, used, reserved = books(ae)
+    check("ae 账实相符且仅被成交候补占用 1",
+          ok and used == 1, f"used={used} reserved={reserved}")
+
+    print("== 24. 有效期边界：恰在失效时刻处理视为已过期 ==")
+    mb = make_material(c, "wl-edge")
+    ab = make_auth(c, mb, 1, region="TT2")
+    db_ = apply(c, [mb], region="TT2").json()["id"]
+    w_edge = waitlist(c, [mb], region="TT2", ttl=1).json()["id"]
+    # expires_at 置为 now（左闭右开：now < expires_at 才有效）
+    force_waitlist_expire(w_edge)
+    c.post(f"/api/v1/distributions/{db_}/revoke")
+    body = get_wait(c, w_edge).json()
+    check("恰在失效时刻 expired", body["status"] == "expired", body)
+    check("额度未被过期候补占用", get_auth(c, ab)["used_count"] == 0)
+
+    print("== 25. 全部过期：连续标记 expired 至队空，释放的额度留给新申请 ==")
+    mx = make_material(c, "wl-allexp")
+    ax = make_auth(c, mx, 1, region="TT3")
+    dx = apply(c, [mx], region="TT3").json()["id"]
+    wx1 = waitlist(c, [mx], region="TT3", ttl=1).json()["id"]
+    wx2 = waitlist(c, [mx], region="TT3", ttl=1).json()["id"]
+    force_waitlist_expire(wx1)
+    force_waitlist_expire(wx2)
+    r = c.post(f"/api/v1/distributions/{dx}/revoke")
+    check("撤销 200", r.status_code == 200, r.text)
+    body = get_wait(c, wx1).json()
+    check("wx1 expired", body["status"] == "expired", body)
+    body = get_wait(c, wx2).json()
+    check("wx2 expired", body["status"] == "expired", body)
+    check("过期后新直接申请可成交",
+          apply(c, [mx], region="TT3").status_code == 201)
+    check("ax used=1（新直接申请）", get_auth(c, ax)["used_count"] == 1)
+
+    print("== 26. 单条查询触发惰性过期（无其他写事务） ==")
+    mq = make_material(c, "wl-query")
+    aq = make_auth(c, mq, 1, region="TT4")
+    dq = apply(c, [mq], region="TT4").json()["id"]  # 占满，候补只能入队
+    wq = waitlist(c, [mq], region="TT4", ttl=1).json()["id"]
+    check("候补等待", get_wait(c, wq).json()["status"] == "pending")
+    force_waitlist_expire(wq)
+    body = get_wait(c, wq).json()
+    check("查询落库 expired", body["status"] == "expired", body)
+    check("expire_reason 已记录",
+          body["expire_reason"] == "ttl_expired", body)
+    # 落库校验：直接读库确认状态已持久化
+    db = SessionLocal()
+    try:
+        row = db.get(models.Waitlist, wq)
+        check("库内状态已落库 expired", row.status == "expired"
+              and row.expired_at is not None
+              and row.expire_reason == "ttl_expired")
+    finally:
+        db.close()
+    # 清理占用（顺带验证过期候补不影响撤销后的队列）
+    c.post(f"/api/v1/distributions/{dq}/revoke")
+    check("aq 额度已释放", get_auth(c, aq)["used_count"] == 0)
+
+    print("== 27. 列表惰性呈现 expired 与状态过滤 ==")
+    ml = make_material(c, "wl-list")
+    al = make_auth(c, ml, 1, region="TT5")
+    dl = apply(c, [ml], region="TT5").json()["id"]
+    wl_p = waitlist(c, [ml], region="TT5", ttl=60).json()["id"]   # 仍有效
+    wl_e = waitlist(c, [ml], region="TT5", ttl=1).json()["id"]    # 将过期
+    force_waitlist_expire(wl_e)
+    # 列表是只读视图：过期候补在响应中派生为 expired（不落库）
+    rows = {w["id"]: w for w in c.get("/api/v1/waitlists").json()}
+    check("列表派生 expired", rows[wl_e]["status"] == "expired", rows[wl_e])
+    check("列表有效候补仍 pending", rows[wl_p]["status"] == "pending",
+          rows[wl_p])
+    expired_list = c.get("/api/v1/waitlists",
+                         params={"status": "expired"}).json()
+    check("expired 过滤包含该候补",
+          any(w["id"] == wl_e for w in expired_list), expired_list)
+    pending_list = c.get("/api/v1/waitlists",
+                         params={"status": "pending"}).json()
+    check("pending 过滤不含已过期",
+          all(w["id"] != wl_e for w in pending_list), pending_list)
+    # 单条查询落库后，再查列表状态一致
+    get_wait(c, wl_e)
+    rows2 = {w["id"]: w for w in c.get("/api/v1/waitlists").json()}
+    check("落库后列表仍为 expired", rows2[wl_e]["status"] == "expired")
+    check("列表返回失效信息",
+          rows2[wl_e]["expire_reason"] == "ttl_expired"
+          and rows2[wl_e]["expired_at"] is not None, rows2[wl_e])
+    c.post(f"/api/v1/distributions/{dl}/revoke")  # 释放 → wl_p 成交
+
+    print("== 28. 已过期候补不可取消（409 waitlist_already_expired） ==")
+    mc = make_material(c, "wl-cancel-exp")
+    ac = make_auth(c, mc, 1, region="TT6")
+    dc = apply(c, [mc], region="TT6").json()["id"]
+    wc = waitlist(c, [mc], region="TT6", ttl=1).json()["id"]
+    force_waitlist_expire(wc)
+    r = c.post(f"/api/v1/waitlists/{wc}/cancel")
+    check("过期取消 409",
+          r.status_code == 409
+          and r.json()["error"]["code"] == "waitlist_already_expired", r.text)
+    body = get_wait(c, wc).json()
+    check("仍是 expired 终态", body["status"] == "expired", body)
+    check("expired_at 仍有记录", body["expired_at"] is not None, body)
+    c.post(f"/api/v1/distributions/{dc}/revoke")
+    ok, used, _ = books(ac)
+    check("ac 账实相符且过期候补未占额", ok and used == 0, f"used={used}")
+
+    print("== 29. 提交时超范围 TTL 与既有拒绝规则一致（不入队） ==")
+    # 无匹配授权 + 非法 TTL：请求体 422（FastAPI 校验），无候补落库
+    before = len(c.get("/api/v1/waitlists").json())
+    r = c.post("/api/v1/waitlists", json={
+        "material_ids": [mc], "region": "CN", "channel": "tv",
+        "occur_at": OCCUR, "ttl_minutes": 0})
+    check("非法 TTL 422", r.status_code == 422, r.text)
+    after = len(c.get("/api/v1/waitlists").json())
+    check("非法请求不入队", before == after, f"{before} != {after}")
+    # 合法 TTL 但无匹配授权：waitlist_rejected，不入队
+    r = waitlist(c, [mc], channel="tv", ttl=10)
+    check("无匹配 422 waitlist_rejected",
+          r.status_code == 422
+          and r.json()["error"]["code"] == "waitlist_rejected", r.text)
 
     print(f"\n结果：{passed} 通过，{failed} 失败")
     return 1 if failed else 0

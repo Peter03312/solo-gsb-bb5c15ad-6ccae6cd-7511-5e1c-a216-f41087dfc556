@@ -25,11 +25,13 @@
 ========
 候补申请沿用既有匹配与重叠授权选择规则：全部可承接则直接成交（生成
 approved 申请）；每项均有匹配授权但额度不足才入本通道队列（不占额）；
-任一项缺少匹配授权则整体逐项拒绝。撤销、预留取消/到期、改期、改挂在
-通道锁内释放额度后，以及新直接申请/新候补受理前，都会按受理顺序重算
-队首：可整体承接则原子占额转为一笔 approved 申请并继续下一队首；
-额度仍不足则停止本轮；授权已不再匹配则标记失败并继续后项。因此新直接
-申请永远不会抢走可成交候补的额度。
+任一项缺少匹配授权则整体逐项拒绝。候补携带 1～1440 分钟的申请有效期，
+任一通道写事务/候补查询在通道锁内先把已过失效时刻的待成交候补批量
+标记 expired（记录失效时刻与原因、释放队列位置，不归还次数）；撤销、
+预留取消/到期、改期、改挂释放额度后，以及新直接申请/新候补受理前，
+再按受理顺序处理队首：已过期者跳过、可整体承接则原子占额转为一笔
+approved 申请并继续下一队首；额度仍不足则停止本轮；授权已不再匹配
+则标记失败并继续后项。因此新直接申请永远不会抢走可成交候补的额度。
 
 额度模型
 ========
@@ -70,6 +72,7 @@ from app.errors import (
     ResourceNotFound,
     UnknownMaterial,
     WaitlistAlreadyCancelled,
+    WaitlistAlreadyExpired,
     WaitlistAlreadyFailed,
     WaitlistAlreadyFulfilled,
     WaitlistNotPending,
@@ -308,12 +311,23 @@ def _settle_expired(
         db.flush()
         # 上面的 Core UPDATE 绕过了 ORM；使本事务后续属性读取拿到新值。
         db.expire_all()
-        if region is not None:
-            # 到期释放额度后，先重算本通道候补队首（成交会消耗刚释放的
-            # 额度，失败标记会推进队列）。
-            _process_waitlist(db, region, channel)
-        # 候补成交可能消耗了本批授权额度：重新锁定读取最新计数后返回。
-        locked = _lock_authorizations(db, lock_ids)
+
+    if region is not None:
+        # 候补有效期惰性结算：读路径与写路径统一结算，使「到期即失效」
+        # 对查询/取消立即可见（候补不占额，无需归还）。
+        expired_wait = _expire_waitlists(db, region, channel, now)
+
+        # 到期预留释放额度后，按受理顺序重算本通道候补队首（成交会消耗
+        # 刚释放的额度；过期让出的位置在成交处理中同样向前推进）。
+        # 注意：仅有候补过期而无额度释放时不触发队首成交重算——过期标记
+        # 只释放队列位置，不改变额度；读路径（查询）也不做成交判定，
+        # 授权停用等非额度事件由此不会在读路径把候补标记 failed。
+        if expiring:
+            _process_waitlist(db, region, channel, now)
+
+        # 预留到期释放或候补成交可能改变授权计数：重新锁定读取最新值。
+        if expiring or expired_wait:
+            locked = _lock_authorizations(db, lock_ids)
     return locked
 
 
@@ -440,11 +454,47 @@ def _candidate_auth_ids(
 
 
 # ------------------------------------------------------------- 候补队列
-def _process_waitlist(db: Session, region: str, channel: str) -> int:
+def _expire_waitlists(
+    db: Session, region: str, channel: str, now: datetime
+) -> int:
+    """把通道内所有已过失效时刻的待成交候补批量标记为 expired。
+
+    不要求是队首：与预留的惰性结算一致，任一通道写事务/候补查询在成交
+    处理前统一结算，使「到期即失效」立即可见；随后按受理顺序处理队首时
+    已让出的位置自然推进，过期候补不再挡在有效候补之前。候补在队列中
+    不占任何额度，标记过期无需归还次数。返回被标记的条数。
+    """
+    rowcount = db.execute(
+        update(models.Waitlist)
+        .where(
+            models.Waitlist.region == region,
+            models.Waitlist.channel == channel,
+            models.Waitlist.status == "pending",
+            models.Waitlist.expires_at <= now,
+        )
+        .values(
+            status="expired",
+            expire_reason="ttl_expired",
+            expired_at=now,
+        )
+    ).rowcount
+    if rowcount:
+        db.flush()
+        db.expire_all()
+    return rowcount
+
+
+def _process_waitlist(
+    db: Session, region: str, channel: str, now: datetime | None = None
+) -> int:
     """在通道咨询锁内按受理顺序处理本通道候补队列，返回本轮成交笔数。
 
     每轮只看队首（``id`` 最小的 pending 候补）：
 
+    - 队首**已过有效期**（左闭右开：``now < expires_at`` 才有效，恰在
+      失效时刻视为已过期）：标记 ``expired``、以 ``expired_at`` 记录
+      失效时刻、``expire_reason`` 记录失效原因，释放其队列位置，继续
+      按原顺序尝试后续候补；
     - 队首**可整体承接**：原子占额并转为一笔 approved 申请
       （``fulfilled``），继续处理下一队首；
     - 队首**授权已不再匹配**（任一项无匹配授权或匹配授权均已停用）：
@@ -452,6 +502,7 @@ def _process_waitlist(db: Session, region: str, channel: str) -> int:
     - 队首**仍匹配但额度不足**：停止本轮，队首留在队列等待下次释放
       （严格按受理顺序，不跳过队首看后续候补）。
     """
+    now = now or utcnow()
     fulfilled = 0
     while True:
         head = db.scalar(
@@ -467,6 +518,15 @@ def _process_waitlist(db: Session, region: str, channel: str) -> int:
         )
         if head is None:
             return fulfilled
+
+        # 已过期队首先退出队列：标记 expired 并记录失效时刻与原因，
+        # 释放队列位置后按原顺序继续尝试后续候补（候补不占额，无需归还）。
+        if head.expires_at <= now:
+            head.status = "expired"
+            head.expire_reason = "ttl_expired"
+            head.expired_at = now
+            db.flush()
+            continue
 
         material_ids = list(
             db.scalars(
@@ -540,7 +600,7 @@ def _process_waitlist(db: Session, region: str, channel: str) -> int:
             )
         head.status = "fulfilled"
         head.distribution_id = distribution.id
-        head.fulfilled_at = utcnow()
+        head.fulfilled_at = now
         db.flush()
         fulfilled += 1
 
@@ -575,7 +635,8 @@ def create_distribution(
 
         # 3b) 新直接申请须先处理可成交候补，不得抢走其额度：按受理顺序
         #     重算队首后再做本次判定；候补成交消耗了额度时重读最新计数。
-        if _process_waitlist(db, data.region, data.channel):
+        _expire_waitlists(db, data.region, data.channel, now)
+        if _process_waitlist(db, data.region, data.channel, now):
             locked_rows = _lock_authorizations(db, candidate_ids)
 
         # 4) 逐项判定（未到期预留参与余量：used + reserved < max）。
@@ -747,7 +808,8 @@ def revoke_distribution(
         db.flush()
 
         # 撤销释放额度后，按受理顺序重算本通道候补队首。
-        _process_waitlist(db, region, channel)
+        _expire_waitlists(db, region, channel, utcnow())
+        _process_waitlist(db, region, channel, utcnow())
         db.commit()
     except (ResourceNotFound, AlreadyRevoked):
         raise
@@ -891,7 +953,8 @@ def reschedule_distribution(
         db.flush()
 
         # 改期搬移可能释放了原授权额度：按受理顺序重算本通道候补队首。
-        _process_waitlist(db, region, channel)
+        _expire_waitlists(db, region, channel, utcnow())
+        _process_waitlist(db, region, channel, utcnow())
         db.commit()
     except (ResourceNotFound, DistributionRevoked, RescheduleRejected):
         raise
@@ -1311,7 +1374,8 @@ def cancel_reservation(db: Session, reservation_id: int) -> models.Reservation:
         db.flush()
 
         # 取消预留释放额度后，按受理顺序重算本通道候补队首。
-        _process_waitlist(db, region, channel)
+        _expire_waitlists(db, region, channel, utcnow())
+        _process_waitlist(db, region, channel, utcnow())
         db.commit()
     except (
         ResourceNotFound,
@@ -1566,7 +1630,8 @@ def migrate_authorization(
 
         # 改挂后原授权停用、占用迁出：按受理顺序重算本通道候补队首
         # （仍匹配但额度释放的候补可成交；匹配授权已停用的候补标记失败）。
-        _process_waitlist(db, source.region, source.channel)
+        _expire_waitlists(db, source.region, source.channel, utcnow())
+        _process_waitlist(db, source.region, source.channel, utcnow())
         db.commit()
     except MigrationRejected:
         db.rollback()
@@ -1591,9 +1656,13 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
     - 全部可承接：直接原子占额生成一笔 approved 申请，候补记为
       ``fulfilled`` 并关联申请编号；
     - 每项均有匹配授权但额度不足：进入本通道候补队列（``pending``，
-      按受理顺序等待，不占任何额度）；
+      按受理顺序等待，不占任何额度；**只在受理时刻 + ttl_minutes 的
+      有效期内等待成交**，到期后由通道处理队首时标记 expired）；
     - 任一项缺少匹配授权（无匹配或匹配授权均已停用）：整体逐项拒绝，
       不入队、不占额。
+
+    字段缺失/超范围（如 ``ttl_minutes`` 不在 1～1440）由请求模型在入口
+    统一 422 拒绝，不入队。
     """
     material_ids = list(data.material_ids)
     _validate_material_ids(db, material_ids)
@@ -1601,6 +1670,7 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
     try:
         _channel_lock(db, data.region, data.channel)
         now = utcnow()
+        expires_at = now + timedelta(minutes=data.ttl_minutes)
 
         candidate_ids = _candidate_auth_ids(
             db, material_ids, data.region, data.channel, data.occur_at
@@ -1614,7 +1684,8 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
         )
 
         # 既有候补按受理顺序优先：先重算队首，新候补不得插队抢额。
-        if _process_waitlist(db, data.region, data.channel):
+        _expire_waitlists(db, data.region, data.channel, now)
+        if _process_waitlist(db, data.region, data.channel, now):
             locked_rows = _lock_authorizations(db, candidate_ids)
 
         chosen, reasons = _evaluate(
@@ -1636,6 +1707,8 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
                 region=data.region,
                 channel=data.channel,
                 occur_at=data.occur_at,
+                ttl_minutes=data.ttl_minutes,
+                expires_at=expires_at,
                 status="pending",
             )
             db.add(waitlist)
@@ -1699,6 +1772,8 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
             region=data.region,
             channel=data.channel,
             occur_at=data.occur_at,
+            ttl_minutes=data.ttl_minutes,
+            expires_at=expires_at,
             status="fulfilled",
             distribution_id=distribution.id,
             fulfilled_at=now,
@@ -1745,7 +1820,12 @@ def _load_waitlist(
 
 
 def get_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
-    """查询候补；先在通道内结算到期预留（可能顺带成交本通道候补）。"""
+    """查询候补；先在通道内结算到期预留并按受理顺序重算候补队首。
+
+    重算会把已过有效期的待成交候补**落库**为 ``expired``（记录失效时刻
+    与原因）、把可成交候补落库为 ``fulfilled``，故单条查询返回的是结算
+    后的准确终态。
+    """
     head = db.execute(
         select(
             models.Waitlist.region,
@@ -1768,40 +1848,60 @@ def get_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
 def list_waitlists(
     db: Session, status: str | None
 ) -> list[models.Waitlist]:
-    """查询候补列表（按受理顺序），可按状态过滤。"""
+    """查询候补列表（按受理顺序），可按状态过滤。
+
+    列表为只读视图：库内仍 pending 但已过失效时刻（``expires_at <= now``）
+    的候补按 **expired** 呈现（写路径与单条查询会惰性结算落库；此处仅在
+    响应中派生状态，不产生写事务）。
+    """
     if status is not None and status not in (
         "pending",
         "fulfilled",
         "failed",
+        "expired",
         "cancelled",
     ):
         raise InvalidWaitlistStatus(status)
 
-    stmt = (
-        select(models.Waitlist)
-        .options(
-            selectinload(models.Waitlist.items).selectinload(
-                models.WaitlistItem.material
-            ),
-            selectinload(models.Waitlist.distribution)
-            .selectinload(models.Distribution.items)
-            .selectinload(models.DistributionItem.material),
-            selectinload(models.Waitlist.distribution)
-            .selectinload(models.Distribution.items)
-            .selectinload(models.DistributionItem.authorization),
+    now = utcnow()
+    rows = list(
+        db.scalars(
+            select(models.Waitlist)
+            .options(
+                selectinload(models.Waitlist.items).selectinload(
+                    models.WaitlistItem.material
+                ),
+                selectinload(models.Waitlist.distribution)
+                .selectinload(models.Distribution.items)
+                .selectinload(models.DistributionItem.material),
+                selectinload(models.Waitlist.distribution)
+                .selectinload(models.Distribution.items)
+                .selectinload(models.DistributionItem.authorization),
+            )
+            .order_by(models.Waitlist.id.asc())
         )
-        .order_by(models.Waitlist.id.asc())
     )
-    if status is not None:
-        stmt = stmt.where(models.Waitlist.status == status)
-    return list(db.scalars(stmt))
+
+    result: list[models.Waitlist] = []
+    for waitlist in rows:
+        effective = waitlist.status
+        if waitlist.status == "pending" and waitlist.expires_at <= now:
+            effective = "expired"
+        if status is None or effective == status:
+            # 分离后覆盖派生状态，避免把瞬时状态标记为脏对象。
+            db.expunge(waitlist)
+            object.__setattr__(waitlist, "status", effective)
+            result.append(waitlist)
+    return result
 
 
 def cancel_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
-    """取消待成交候补（仅 pending 可取消，仅生效一次）。
+    """取消待成交候补（仅未过有效期的 pending 可取消，仅生效一次）。
 
-    候补在队列中不占任何额度，取消无需归还；已成交的候补不可取消，
-    其生成的申请沿用既有撤销规则（``POST /distributions/{id}/revoke``）。
+    候补在队列中不占任何额度，取消无需归还；通道结算先把已过有效期的
+    候补置为 expired，故对已过期候补取消返回 409
+    （``waitlist_already_expired``）；已成交的候补不可取消，其生成的
+    申请沿用既有撤销规则（``POST /distributions/{id}/revoke``）。
     """
     head = db.execute(
         select(
@@ -1829,13 +1929,17 @@ def cancel_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
         if waitlist.status == "failed":
             db.rollback()
             raise WaitlistAlreadyFailed(waitlist_id)
+        if waitlist.status == "expired":
+            db.rollback()
+            raise WaitlistAlreadyExpired(waitlist_id)
 
         waitlist.status = "cancelled"
         waitlist.cancelled_at = utcnow()
         db.flush()
 
         # 队首可能因本次取消而变化：按受理顺序重算本通道候补队首。
-        _process_waitlist(db, region, channel)
+        _expire_waitlists(db, region, channel, utcnow())
+        _process_waitlist(db, region, channel, utcnow())
         db.commit()
     except (ResourceNotFound, WaitlistNotPending):
         raise
